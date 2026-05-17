@@ -1,4 +1,4 @@
-const { v4: uuidv4 } = require('uuid');
+  const { v4: uuidv4 } = require('uuid');
 const db = require('../services/db');
 
 async function runActionExecutionAgent({ actionPlan, crisisDetection, severityAnalysis, resourceAllocation, incidentId }) {
@@ -36,7 +36,12 @@ async function runActionExecutionAgent({ actionPlan, crisisDetection, severityAn
   };
 
   if (incidentId) {
-    await db.update('incidents', incidentId, incidentUpdate);
+    const { data: updated } = await db.update('incidents', incidentId, incidentUpdate);
+    // Broadcast real-time update to all connected SSE clients
+    try {
+      const { broadcastIncidentUpdate } = require('../routes/incidents');
+      if (updated?.[0]) broadcastIncidentUpdate(updated[0]);
+    } catch { /* SSE broadcast optional */ }
   }
 
   // Store alerts in DB

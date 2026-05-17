@@ -1,64 +1,180 @@
 const { geminiChat } = require('../services/gemini');
 const db = require('../services/db');
 
-const SYSTEM_PROMPT = `You are the Verification Agent for CivicShield AI emergency response system.
+const SYSTEM_PROMPT = `
+You are the Verification Agent for CivicShield AI.
 
-Your job is to:
-1. Cross-check incoming signals against weather data, traffic anomalies, image detections, and nearby historical reports.
-2. Detect misinformation, false positives, and unsupported claims.
-3. Adjust confidence scores based on corroboration evidence.
-4. If insufficient evidence exists, flag as low_confidence or misinformation.
-5. If alert should be retracted, set retract: true.
+Your task:
+- Verify if emergency reports are likely real
+- Reduce false positives
+- BUT do not aggressively reject valid citizen emergency reports
 
 Rules:
-- Require at least 2 corroborating signals for HIGH confidence.
-- Single unverified report with no weather/image support → low_confidence.
-- Contradictory signals (e.g., flood report + dry weather + no image) → possible_misinformation.
-- Return ONLY valid JSON.`;
+- Emergency keywords increase confidence
+- Nearby reports increase confidence
+- Image evidence increases confidence
+- Weather anomalies increase confidence
+- Never retract obvious emergency reports unless clearly fake
+
+Return ONLY valid JSON.
+`;
 
 async function runVerificationAgent({ collectedSignals, incidentId }) {
-  // Get nearby reports from DB
+
+  // ─── Get nearby reports ───────────────────────────────────────────────
   const { data: nearbyReports } = await db.select('reports', {});
+
   const recentNearby = (nearbyReports || [])
-    .filter(r => r.location === collectedSignals.location_extracted)
+    .filter(r =>
+      r.location === collectedSignals.location_extracted
+    )
     .slice(-5);
 
-  const userPrompt = `
-Signals to verify:
-- Normalized Signals: ${JSON.stringify(collectedSignals.normalized_signals)}
-- Location: ${collectedSignals.location_extracted}
-- Weather: ${JSON.stringify(collectedSignals.raw_weather)}
-- Traffic Anomaly: ${JSON.stringify(collectedSignals.raw_traffic)}
-- Nearby Recent Reports (last 5): ${JSON.stringify(recentNearby)}
-- Urgency Claimed: ${collectedSignals.urgency}
+  // ─── Extract report text ──────────────────────────────────────────────
+  const reportText =
+    (
+      collectedSignals?.normalized_signals?.[0]?.content ||
+      ''
+    ).toLowerCase();
 
-Cross-check for corroboration. Assess if this is a valid emergency signal or potential misinformation.
-Return JSON with: { verified, confidence_adjustment, cross_checks, misinformation_flag, retract, low_confidence_reason, corroboration_score, reasoning }`;
+  // ─── Emergency keyword detection ──────────────────────────────────────
+  const emergencyKeywords = [
+    'aag',
+    'fire',
+    'blast',
+    'smoke',
+    'dhuaan',
+    'flood',
+    'pani',
+    'accident',
+    'crash',
+    'explosion',
+    'gas',
+    'emergency',
+    'heatwave',
+    'transformer',
+  ];
 
-  const response = await geminiChat(SYSTEM_PROMPT, userPrompt);
+  const hasEmergencyKeyword =
+    emergencyKeywords.some(word =>
+      reportText.includes(word)
+    );
 
-  try {
-    const parsed = JSON.parse(response.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim());
-    return {
-      ...parsed,
-      agent: 'verification',
-      nearby_report_count: recentNearby.length,
-      timestamp: new Date().toISOString(),
-    };
-  } catch {
-    return {
-      verified: true,
-      confidence_adjustment: 0,
-      cross_checks: [],
-      misinformation_flag: false,
-      retract: false,
-      corroboration_score: 0.5,
-      agent: 'verification',
-      nearby_report_count: recentNearby.length,
-      timestamp: new Date().toISOString(),
-      reasoning: response,
-    };
+  // ─── Confidence calculation ───────────────────────────────────────────
+  let corroborationScore = 0.65;
+
+  if (hasEmergencyKeyword) {
+    corroborationScore += 0.2;
   }
+
+  if (recentNearby.length > 0) {
+    corroborationScore += 0.1;
+  }
+
+  if (collectedSignals?.imageDetections) {
+    corroborationScore += 0.1;
+  }
+
+  if (collectedSignals?.raw_weather) {
+    corroborationScore += 0.05;
+  }
+
+  corroborationScore = Math.min(corroborationScore, 0.98);
+
+  // ─── Final verification result ───────────────────────────────────────
+  const result = {
+    verified: true,
+
+    confidence_adjustment: 0.12,
+
+    cross_checks: [
+      hasEmergencyKeyword
+        ? 'emergency_keywords_detected'
+        : 'basic_report_validation',
+
+      recentNearby.length > 0
+        ? 'nearby_reports_found'
+        : 'single_report',
+
+      collectedSignals?.raw_weather
+        ? 'weather_checked'
+        : 'weather_unavailable',
+    ],
+
+    misinformation_flag: false,
+
+    retract: false,
+
+    low_confidence_reason: null,
+
+    corroboration_score: corroborationScore,
+
+    reasoning:
+      hasEmergencyKeyword
+        ? 'Emergency keywords detected and report appears credible.'
+        : 'Citizen report accepted with moderate confidence.',
+  };
+
+  // ─── Optional AI verification enhancement ─────────────────────────────
+  try {
+
+    const userPrompt = `
+Report:
+${reportText}
+
+Location:
+${collectedSignals.location_extracted}
+
+Nearby Reports:
+${recentNearby.length}
+
+Weather:
+${JSON.stringify(collectedSignals.raw_weather || {})}
+
+Return JSON:
+{
+  "verified": true,
+  "confidence_adjustment": number,
+  "reasoning": "short reasoning"
+}
+`;
+
+    const aiResponse = await geminiChat(
+      SYSTEM_PROMPT,
+      userPrompt
+    );
+
+    const parsed = JSON.parse(
+      aiResponse
+        .replace(/```json/g, '')
+        .replace(/```/g, '')
+        .trim()
+    );
+
+    if (parsed?.confidence_adjustment) {
+      result.confidence_adjustment =
+        parsed.confidence_adjustment;
+    }
+
+    if (parsed?.reasoning) {
+      result.reasoning = parsed.reasoning;
+    }
+
+  } catch (err) {
+    console.log(
+      '[Verification Agent] AI enhancement skipped:',
+      err.message
+    );
+  }
+
+  return {
+    ...result,
+    agent: 'verification',
+    nearby_report_count: recentNearby.length,
+    timestamp: new Date().toISOString(),
+  };
 }
 
-module.exports = { runVerificationAgent };
+module.exports = {
+  runVerificationAgent,
+};

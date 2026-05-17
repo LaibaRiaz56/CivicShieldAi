@@ -1,46 +1,189 @@
-// ─── Network Configuration ────────────────────────────────────────────────────
-// On Android, "localhost" means the PHONE itself — NOT your Mac.
-// You must use your Mac's LAN IP address.
-// ⚠️  UPDATE THIS if your Mac's IP changes (run: ifconfig | grep "inet ")
-export const API_URL = 'http://10.7.68.22:4000';
+import { Platform } from 'react-native';
 
-// ─── Generic fetch wrappers ───────────────────────────────────────────────────
-export const api = {
-  async get(path: string): Promise<any> {
+// ─── Backend URL ──────────────────────────────────────────────────────────────
+const BACKEND_IP = '10.156.19.80';
+const BACKEND_PORT = '4000';
+
+export const API_URL = `http://${BACKEND_IP}:${BACKEND_PORT}`;
+
+// ─── Fetch Helper ────────────────────────────────────────────────────────────
+async function fetchWithRetry(
+  url: string,
+  options: RequestInit = {},
+  timeoutMs = 10000,
+  retries = 2,
+): Promise<Response> {
+  for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 8000);
-      const r = await fetch(`${API_URL}${path}`, { signal: controller.signal });
-      clearTimeout(timeout);
-      if (!r.ok) throw new Error(`HTTP ${r.status}`);
-      return r.json();
-    } catch (e: any) {
-      console.warn(`[API GET] ${path} failed:`, e.message);
+
+      const timer = setTimeout(() => {
+        controller.abort();
+      }, timeoutMs);
+
+      const response = await fetch(url, {
+        ...options,
+        signal: controller.signal,
+      });
+
+      clearTimeout(timer);
+
+      return response;
+    } catch (err) {
+      if (attempt === retries) {
+        throw err;
+      }
+
+      await new Promise(resolve =>
+        setTimeout(resolve, 1000 * (attempt + 1)),
+      );
+    }
+  }
+
+  throw new Error('Max retries exceeded');
+}
+
+// ─── API Service ─────────────────────────────────────────────────────────────
+export const api = {
+  // GET Request
+  async get(path: string, timeoutMs = 10000): Promise<any> {
+    try {
+      const response = await fetchWithRetry(
+        `${API_URL}${path}`,
+        {},
+        timeoutMs,
+      );
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+
+      return await response.json();
+    } catch (error: any) {
+      console.warn(`[API GET ERROR] ${path}`, error.message);
+
       return null;
     }
   },
 
-  async post(path: string, body: any, isFormData = false): Promise<any> {
+  // POST Request
+  async post(
+    path: string,
+    body: any,
+    isFormData = false,
+  ): Promise<any> {
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000); // 15s for uploads
-      const r = await fetch(`${API_URL}${path}`, {
-        method: 'POST',
-        signal: controller.signal,
-        headers: isFormData ? undefined : { 'Content-Type': 'application/json' },
-        body: isFormData ? body : JSON.stringify(body),
-      });
-      clearTimeout(timeout);
-      return r.json();
-    } catch (e: any) {
-      console.warn(`[API POST] ${path} failed:`, e.message);
-      return { error: e.message };
+      const response = await fetchWithRetry(
+        `${API_URL}${path}`,
+        {
+          method: 'POST',
+          headers: isFormData
+            ? undefined
+            : {
+              'Content-Type': 'application/json',
+            },
+          body: isFormData ? body : JSON.stringify(body),
+        },
+        20000,
+      );
+
+      return await response.json();
+    } catch (error: any) {
+      console.warn(`[API POST ERROR] ${path}`, error.message);
+
+      return {
+        error: error.message,
+      };
     }
+  },
+
+  // Upload Audio
+  async uploadAudio(audioUri: string): Promise<any> {
+    try {
+      const formData = new FormData();
+
+      const filename =
+        audioUri.split('/').pop() || 'voice.m4a';
+
+      formData.append(
+        'audio',
+        {
+          uri: audioUri,
+          name: filename,
+          type: 'audio/m4a',
+        } as any,
+      );
+
+      const response = await fetchWithRetry(
+        `${API_URL}/api/reports/transcribe`,
+        {
+          method: 'POST',
+          body: formData,
+        },
+        30000,
+      );
+
+      return await response.json();
+    } catch (error: any) {
+      console.warn('[UPLOAD AUDIO ERROR]', error.message);
+
+      return {
+        error: error.message,
+      };
+    }
+  },
+
+  // Poll AI Result
+  async pollResult(
+    reportId: string,
+    maxAttempts = 40,
+    intervalMs = 2000,
+  ): Promise<any> {
+    console.log('[POLL STARTED]', reportId);
+
+    for (let i = 0; i < maxAttempts; i++) {
+      await new Promise(resolve =>
+        setTimeout(resolve, i === 0 ? 2000 : intervalMs),
+      );
+
+      const result = await this.get(
+        `/api/reports/${reportId}/result`,
+      );
+
+      console.log('[POLL RESULT]', result);
+
+      if (!result) {
+        continue;
+      }
+
+      // Still processing
+      if (result.status === 'processing') {
+        console.log('[PROCESSING]');
+        continue;
+      }
+
+      // Success
+      if (
+        result.status === 'completed' ||
+        result.status === 'active'
+      ) {
+        console.log('[INCIDENT RECEIVED]');
+        return result;
+      }
+    }
+
+    return {
+      status: 'timeout',
+    };
   },
 };
 
-// ─── Types ────────────────────────────────────────────────────────────────────
-export type SeverityLevel = 'CRITICAL' | 'HIGH' | 'MODERATE' | 'LOW';
+// ─── Types ───────────────────────────────────────────────────────────────────
+export type SeverityLevel =
+  | 'CRITICAL'
+  | 'HIGH'
+  | 'MODERATE'
+  | 'LOW';
 
 export interface Incident {
   id: string;
@@ -58,50 +201,31 @@ export interface Incident {
   created_at: string;
 }
 
-// ─── Design Tokens ────────────────────────────────────────────────────────────
+// ─── UI Colors ───────────────────────────────────────────────────────────────
 export const COLORS = {
-  bg:     '#080c14',
-  card:   '#0d1421',
-  card2:  '#111827',
-  border: 'rgba(255,255,255,0.08)',
-  text:   '#e8f0fe',
-  muted:  '#8899b4',
-  faint:  '#4a5568',
-  blue:   '#00a8ff',
-  cyan:   '#00e5ff',
-  green:  '#00e676',
-  red:    '#ff3d3d',
-  orange: '#ff8c00',
-  yellow: '#ffd700',
-  purple: '#b040fb',
+  bg: '#050B16',
+
+  card: '#101826',
+
+  card2: '#172033',
+
+  border: 'rgba(255,255,255,0.10)',
+
+  text: '#FFFFFF',
+
+  muted: '#D1D5DB',
+
+  faint: '#94A3B8',
+
+  blue: '#00B2FF',
+
+  cyan: '#00E5FF',
+
+  green: '#00FF88',
+
+  red: '#FF4D4D',
+
+  orange: '#FFA726',
+
+  purple: '#BB86FC',
 };
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-export function severityColor(level?: string): string {
-  return ({ CRITICAL: '#ff3d3d', HIGH: '#ff8c00', MODERATE: '#ffd700', LOW: '#00e676' } as any)[level ?? ''] ?? '#8899b4';
-}
-export function crisisEmoji(type: string): string {
-  return ({
-    urban_flooding:        '🌊',
-    transformer_explosion: '⚡',
-    electrical_fire:       '🔥',
-    smoke_fire:            '🌫️',
-    road_accident:         '🚗',
-    heatwave:              '🌡️',
-    infrastructure_failure:'🏗️',
-    crowd_emergency:       '👥',
-    gas_leak:              '☢️',
-  } as any)[type] ?? '⚠️';
-}
-export function crisisLabel(type: string): string {
-  return type?.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) ?? 'Unknown';
-}
-
-// ─── Inline demo data (shown when backend is unreachable) ─────────────────────
-export const DEMO_INCIDENTS: Incident[] = [
-  { id: 'd1', status: 'active',     crisis_type: 'urban_flooding',        confidence: 0.91, severity_level: 'HIGH',     location: 'G-10, Islamabad',        report_text: 'G-10 mein pani bhar gaya hai, gadiyan phans gayi hain', ticket_id: 'CS-18472', citizens_alerted: 12000, actions_count: 5, lat: 33.6789, lon: 72.9934, created_at: new Date().toISOString() },
-  { id: 'd2', status: 'active',     crisis_type: 'transformer_explosion', confidence: 0.87, severity_level: 'CRITICAL', location: 'F-8, Islamabad',         report_text: 'F-8 mein transformer blast hua hai, bijli gayi', ticket_id: 'CS-29381', citizens_alerted: 8500,  actions_count: 6, lat: 33.7028, lon: 73.0436, created_at: new Date().toISOString() },
-  { id: 'd3', status: 'contained',  crisis_type: 'road_accident',         confidence: 0.95, severity_level: 'MODERATE', location: 'Motorway M-2, Lahore',    report_text: 'Motorway pe bohat dhuaan hai, truck accident',         ticket_id: 'CS-37194', citizens_alerted: 3200,  actions_count: 4, lat: 31.6340, lon: 74.1950, created_at: new Date().toISOString() },
-  { id: 'd4', status: 'active',     crisis_type: 'heatwave',              confidence: 0.83, severity_level: 'HIGH',     location: 'Karachi, Sindh',          report_text: 'Karachi mein garmi bohat zyada hai, log behosh ho rahe hain', ticket_id: 'CS-41827', citizens_alerted: 25000, actions_count: 3, lat: 24.8607, lon: 67.0011, created_at: new Date().toISOString() },
-  { id: 'd5', status: 'retracted',  crisis_type: 'urban_flooding',        confidence: 0.21, severity_level: 'LOW',      location: 'I-10, Islamabad',         report_text: 'Yahan bohot pani aa raha hai', ticket_id: undefined, citizens_alerted: 0,     actions_count: 0, lat: 33.6585, lon: 72.9764, created_at: new Date().toISOString() },
-];
